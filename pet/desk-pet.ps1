@@ -105,6 +105,58 @@ function Set-Mood($mood) {
 }
 
 # ---------------------------------------------------------------- 跳转
+# 网页版会话都在同一个「桌宠专用」Chrome 应用窗口里切换：独立的浏览器资料目录（首次要在里面登录 claude.ai），
+# 只监听本机的调试端口；窗口在就通过 DevTools 协议让它跳到新地址并切到前台，不在就重新开一个。
+$CdpPort = 9333
+$ChromeProfile = Join-Path $Dir 'chrome-profile'
+$Chrome = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe' -ErrorAction SilentlyContinue).'(default)'
+if (-not $Chrome) { $Chrome = (Get-ItemProperty 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe' -ErrorAction SilentlyContinue).'(default)' }
+
+function Send-Cdp($wsUrl, $method, $params) {
+  $ws = New-Object System.Net.WebSockets.ClientWebSocket
+  $cts = New-Object System.Threading.CancellationTokenSource 3000
+  try {
+    $ws.ConnectAsync([Uri]$wsUrl, $cts.Token).Wait()
+    $msg = @{ id = 1; method = $method; params = $params } | ConvertTo-Json -Compress -Depth 5
+    $bytes = [Text.Encoding]::UTF8.GetBytes($msg)
+    $seg = New-Object System.ArraySegment[byte] -ArgumentList (, $bytes)
+    $ws.SendAsync($seg, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $cts.Token).Wait()
+    $buf = New-Object byte[] 4096
+    $rseg = New-Object System.ArraySegment[byte] -ArgumentList (, $buf)
+    [void]$ws.ReceiveAsync($rseg, $cts.Token).Wait()
+  } finally { try { $ws.Dispose() } catch { } }
+}
+
+function Focus-ClaudeWindow {
+  # 专用窗口的进程命令行里带着我们的资料目录，找有主窗口的那个切到前台
+  $procs = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*$ChromeProfile*" }
+  foreach ($cp in $procs) {
+    $p = Get-Process -Id $cp.ProcessId -ErrorAction SilentlyContinue
+    if ($p -and $p.MainWindowHandle -ne [IntPtr]::Zero) {
+      if ([PetWin]::IsIconic($p.MainWindowHandle)) { [void][PetWin]::ShowWindow($p.MainWindowHandle, 9) }
+      [void][PetWin]::SetForegroundWindow($p.MainWindowHandle)
+      return
+    }
+  }
+}
+
+function Open-InClaudeWindow($url) {
+  $targets = $null
+  try { $targets = Invoke-RestMethod "http://127.0.0.1:$CdpPort/json" -TimeoutSec 2 } catch { }
+  $page = @($targets) | Where-Object { $_.type -eq 'page' -and $_.url -like 'https://claude.ai/*' } | Select-Object -First 1
+  if (-not $page) { $page = @($targets) | Where-Object { $_.type -eq 'page' } | Select-Object -First 1 }
+  if ($page -and $page.webSocketDebuggerUrl) {
+    try {
+      Send-Cdp $page.webSocketDebuggerUrl 'Page.navigate' @{ url = $url }
+      Send-Cdp $page.webSocketDebuggerUrl 'Page.bringToFront' @{}
+      Focus-ClaudeWindow
+      return
+    } catch { }
+  }
+  if (-not $Chrome) { Start-Process $url; return }   # 没装 Chrome：退回默认浏览器新标签
+  Start-Process $Chrome -ArgumentList @("--user-data-dir=`"$ChromeProfile`"", "--remote-debugging-port=$CdpPort", '--no-first-run', '--no-default-browser-check', '--window-size=1280,900', "--app=$url")
+}
+
 function Jump($a) {
   try {
     if ($a.kind -eq 'background' -or -not $a.pid) {
@@ -114,7 +166,7 @@ function Jump($a) {
       if (Test-Path $stateFile) {
         $bridge = "$(([IO.File]::ReadAllText($stateFile, [Text.Encoding]::UTF8) | ConvertFrom-Json).bridgeSessionId)"
         if ($bridge -match '^cse_(\w+)$') {
-          Start-Process "https://claude.ai/code/session_$($Matches[1])"
+          Open-InClaudeWindow "https://claude.ai/code/session_$($Matches[1])"
           return
         }
       }
