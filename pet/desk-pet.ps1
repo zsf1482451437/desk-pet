@@ -108,7 +108,17 @@ function Set-Mood($mood) {
 function Jump($a) {
   try {
     if ($a.kind -eq 'background' -or -not $a.pid) {
-      # 后台会话：开一个 PowerShell 窗口接入（← 回到 agent 视图，Ctrl+Z 回 shell，会话照常运行）
+      # 后台会话优先在浏览器打开网页版：~/.claude/jobs/<id>/state.json 的 bridgeSessionId 是 cse_xxx，
+      # 网页地址是 https://claude.ai/code/session_xxx
+      $stateFile = Join-Path $env:USERPROFILE ".claude\jobs\$($a.id)\state.json"
+      if (Test-Path $stateFile) {
+        $bridge = "$(([IO.File]::ReadAllText($stateFile, [Text.Encoding]::UTF8) | ConvertFrom-Json).bridgeSessionId)"
+        if ($bridge -match '^cse_(\w+)$') {
+          Start-Process "https://claude.ai/code/session_$($Matches[1])"
+          return
+        }
+      }
+      # 没连到网页的：开一个 PowerShell 窗口接入（← 回到 agent 视图，Ctrl+Z 回 shell，会话照常运行）
       Start-Process powershell.exe -ArgumentList @('-NoExit', '-Command', "& '$Claude' attach $($a.id)") -WorkingDirectory $(if (Test-Path $a.cwd) { $a.cwd } else { $env:USERPROFILE })
       return
     }
