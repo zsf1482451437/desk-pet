@@ -1,7 +1,8 @@
-﻿# Claude Code 桌宠：屏幕角落的小南瓜 + 会话面板。
-# 会话列表以 `claude agents --json` 为准（每 5 秒后台刷新），钩子写的 ~/.desk-pet/events.jsonl 负责提示音和每个会话最后一句话的摘要；不跳动、不自动弹气泡。
-# 南瓜右上角 = 未完成会话数；左键点南瓜弹出未完成会话列表（下方另列刚完成、未确认的），点任意一行跳到该会话；「我知道了」收起已完成的那一行，直到它又完成一轮。
-# 按住南瓜拖动；右键：清空提醒 / 退出。文件须为 UTF-8 带 BOM（Windows PowerShell 5.1 才能读对中文）。
+﻿# Claude Code 桌宠：屏幕角落的小火箭 + 会话面板。
+# 会话列表以 `claude agents --json` 为准（每 5 秒后台刷新），钩子写的 ~/.desk-pet/events.jsonl 负责提示音和每个会话最后一句话的摘要；不自动弹气泡。
+# 火箭右上角 = 未完成会话数；左键点火箭弹出未完成会话列表（下方另列刚完成、未确认的），点任意一行跳到该会话；「我知道了」收起已完成的那一行，直到它又完成一轮；
+# 未完成的行可「标记完成」，该会话有新提醒或新输入时重新出现。点击火箭或鼠标靠近时火箭发射一次。
+# 按住火箭拖动；右键：清空提醒 / 退出。文件须为 UTF-8 带 BOM（Windows PowerShell 5.1 才能读对中文）。
 param([switch]$Open)
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 Add-Type @'
@@ -30,7 +31,7 @@ if (-not $Claude) { $Claude = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize" SizeToContent="WidthAndHeight">
   <StackPanel HorizontalAlignment="Right">
-    <Border x:Name="Bubble" Visibility="Collapsed" CornerRadius="12" Padding="12,10" Margin="0,0,0,6"
+    <Border x:Name="Bubble" Visibility="Collapsed" CornerRadius="12" Padding="12,10" Margin="0,0,0,-36"
             Width="380" HorizontalAlignment="Right" Background="#F7FFFFFF" BorderThickness="2" BorderBrush="#FF8A3D">
       <Border.Effect><DropShadowEffect BlurRadius="14" ShadowDepth="2" Opacity="0.25"/></Border.Effect>
       <StackPanel>
@@ -42,31 +43,44 @@ if (-not $Claude) { $Claude = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
         <TextBlock x:Name="Footer" FontSize="11" Foreground="#8A7A6A" HorizontalAlignment="Right" Margin="0,6,0,0" Cursor="Hand"/>
       </StackPanel>
     </Border>
-    <Grid x:Name="Pet" Width="96" Height="92" HorizontalAlignment="Right" Cursor="Hand" Background="Transparent">
-      <Grid.RenderTransform><TranslateTransform x:Name="Hop" Y="0"/></Grid.RenderTransform>
-      <Ellipse x:Name="Glow" Width="96" Height="80" VerticalAlignment="Bottom" Fill="#00FF8A3D">
-        <Ellipse.Effect><BlurEffect Radius="14"/></Ellipse.Effect>
-      </Ellipse>
-      <Path Data="M46,16 C46,8 50,4 56,2 L58,6 C54,8 52,11 52,17 Z" Fill="#4E7A2E"/>
-      <Ellipse Width="44" Height="64" Margin="8,22,0,0" HorizontalAlignment="Left" VerticalAlignment="Top" Fill="#F07A1E"/>
-      <Ellipse Width="44" Height="64" Margin="0,22,8,0" HorizontalAlignment="Right" VerticalAlignment="Top" Fill="#F07A1E"/>
-      <Ellipse Width="52" Height="68" Margin="0,20,0,0" HorizontalAlignment="Center" VerticalAlignment="Top" Fill="#FF8A2A"/>
-      <Canvas>
-        <Polygon Points="30,44 38,52 22,52" Fill="#3A1A08"/>
-        <Polygon Points="66,44 74,52 58,52" Fill="#3A1A08"/>
-        <Path x:Name="Mouth" Data="M32,64 Q48,76 64,64" Stroke="#3A1A08" StrokeThickness="4" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
-      </Canvas>
-      <Border x:Name="Badge" Visibility="Collapsed" Width="24" Height="24" CornerRadius="12" Background="#E5322D"
-              HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,8,0,0">
-        <TextBlock x:Name="BadgeText" Foreground="White" FontWeight="Bold" FontSize="12" HorizontalAlignment="Center" VerticalAlignment="Center"/>
-      </Border>
+    <!-- 上方 44px 留空给发射时飞出去的那一段（透明区不接收点击） -->
+    <Grid Width="96" Height="136" HorizontalAlignment="Right">
+      <Grid x:Name="Pet" Height="92" VerticalAlignment="Bottom" Cursor="Hand" Background="Transparent">
+        <Ellipse x:Name="Glow" Width="80" Height="80" VerticalAlignment="Bottom" Fill="#00FF8A3D">
+          <Ellipse.Effect><BlurEffect Radius="14"/></Ellipse.Effect>
+        </Ellipse>
+        <Canvas x:Name="Ship">
+          <Canvas.RenderTransform>
+            <TransformGroup>
+              <ScaleTransform x:Name="Bump" CenterX="48" CenterY="46"/>
+              <TranslateTransform x:Name="Fly"/>
+            </TransformGroup>
+          </Canvas.RenderTransform>
+          <Canvas>
+            <Canvas.RenderTransform><ScaleTransform x:Name="Flame" CenterX="48" CenterY="66" ScaleX="1" ScaleY="0"/></Canvas.RenderTransform>
+            <Path Data="M41,66 Q48,96 55,66 Z" Fill="#FF8A2A"/>
+            <Path Data="M44.5,66 Q48,84 51.5,66 Z" Fill="#FFE15A"/>
+          </Canvas>
+          <Path Data="M36,48 L25,66 L36,61 Z" Fill="#E5322D" Stroke="#2B2B3A" StrokeThickness="1.5" StrokeLineJoin="Round"/>
+          <Path Data="M60,48 L71,66 L60,61 Z" Fill="#E5322D" Stroke="#2B2B3A" StrokeThickness="1.5" StrokeLineJoin="Round"/>
+          <Rectangle Canvas.Left="42" Canvas.Top="61" Width="12" Height="5" Fill="#6A6A7A"/>
+          <Path Data="M48,4 C56,12 60,22 60,32 L60,62 L36,62 L36,32 C36,22 40,12 48,4 Z" Fill="#F4F4F8" Stroke="#2B2B3A" StrokeThickness="2" StrokeLineJoin="Round"/>
+          <Path Data="M48,4 C53,9 56.5,15 58.3,22 L37.7,22 C39.5,15 43,9 48,4 Z" Fill="#E5322D"/>
+          <Ellipse Canvas.Left="41" Canvas.Top="30" Width="14" Height="14" Fill="#5BC0F8" Stroke="#2B2B3A" StrokeThickness="2"/>
+          <Rectangle Canvas.Left="47" Canvas.Top="52" Width="2" Height="10" Fill="#D0D0DA"/>
+        </Canvas>
+        <Border x:Name="Badge" Visibility="Collapsed" Width="24" Height="24" CornerRadius="12" Background="#E5322D"
+                HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,4,6,0">
+          <TextBlock x:Name="BadgeText" Foreground="White" FontWeight="Bold" FontSize="12" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+        </Border>
+      </Grid>
     </Grid>
   </StackPanel>
 </Window>
 '@
 $win = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
 $ui = @{}
-foreach ($n in 'Bubble', 'BubbleTitle', 'BubbleText', 'Scroll', 'List', 'Footer', 'Pet', 'Hop', 'Glow', 'Mouth', 'Badge', 'BadgeText') { $ui[$n] = $win.FindName($n) }
+foreach ($n in 'Bubble', 'BubbleTitle', 'BubbleText', 'Scroll', 'List', 'Footer', 'Pet', 'Glow', 'Ship', 'Bump', 'Fly', 'Flame', 'Badge', 'BadgeText') { $ui[$n] = $win.FindName($n) }
 function Brush($hex) { New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($hex)) }
 
 # ---------------------------------------------------------------- 状态
@@ -92,15 +106,35 @@ function State-Key($a) {
   "$($a.state)|$(if ($s) { $s.ts } else { 0 })"
 }
 function Is-Acked($a) { $acks[$a.id] -eq (State-Key $a) }
+# 手动「标记完成」的未完成会话：只要状态没变就当已完成；该会话又来了新提醒或新一轮输入时撤销（见 Handle）
+function Is-Dismissed($a) { $a.state -ne 'done' -and $acks[$a.id] -eq "dismiss|$($a.state)" }
 
-# ---------------------------------------------------------------- 南瓜表情
+# ---------------------------------------------------------------- 火箭：光晕表示状态，点击或鼠标靠近时发射
 function Set-Mood($mood) {
-  switch ($mood) {
-    'alert' { $ui.Mouth.Data = [Windows.Media.Geometry]::Parse('M36,66 Q48,58 60,66 Q48,74 36,66'); $ui.Glow.Fill = Brush '#AAFF3B30' }
-    'done'  { $ui.Mouth.Data = [Windows.Media.Geometry]::Parse('M30,62 Q48,80 66,62'); $ui.Glow.Fill = Brush '#9934C759' }
-    'error' { $ui.Mouth.Data = [Windows.Media.Geometry]::Parse('M34,70 Q48,60 62,70'); $ui.Glow.Fill = Brush '#998E5CF7' }
-    'busy'  { $ui.Mouth.Data = [Windows.Media.Geometry]::Parse('M38,66 L58,66'); $ui.Glow.Fill = Brush '#552F7BEA' }
-    default { $ui.Mouth.Data = [Windows.Media.Geometry]::Parse('M32,64 Q48,76 64,64'); $ui.Glow.Fill = Brush '#00FF8A3D' }
+  $ui.Glow.Fill = Brush $(switch ($mood) { 'alert' { '#AAFF3B30' } 'done' { '#9934C759' } 'busy' { '#552F7BEA' } default { '#00FF8A3D' } })
+}
+
+function Keys($prop, $frames) {
+  $an = New-Object Windows.Media.Animation.DoubleAnimationUsingKeyFrames
+  foreach ($f in $frames) {
+    $k = New-Object Windows.Media.Animation.EasingDoubleKeyFrame $f[1], ([Windows.Media.Animation.KeyTime]::FromTimeSpan([TimeSpan]::FromMilliseconds($f[0])))
+    if ($f[2]) { $k.EasingFunction = New-Object Windows.Media.Animation.QuadraticEase -Property @{ EasingMode = $f[2] } }
+    [void]$an.KeyFrames.Add($k)
+  }
+  $an.FillBehavior = 'Stop'
+  $an
+}
+$script:launchUntil = [datetime]::MinValue
+function Launch {
+  if ([datetime]::Now -lt $script:launchUntil) { return }
+  $script:launchUntil = [datetime]::Now.AddMilliseconds(1700)
+  # 点火抖动 0.3s → 加速升空并淡出 → 原位弹回
+  $ui.Fly.BeginAnimation([Windows.Media.TranslateTransform]::XProperty, (Keys X @(@(0, 0), @(50, -2), @(100, 2), @(150, -2), @(200, 2), @(250, -1), @(300, 0))))
+  $ui.Fly.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, (Keys Y @(@(0, 0), @(300, 2), @(950, -150, 'EaseIn'), @(1250, -150), @(1251, 0), @(1650, 0))))
+  $ui.Flame.BeginAnimation([Windows.Media.ScaleTransform]::ScaleYProperty, (Keys S @(@(0, 0), @(200, 1), @(950, 1.6), @(1100, 0))))
+  $ui.Ship.BeginAnimation([Windows.UIElement]::OpacityProperty, (Keys O @(@(0, 1), @(700, 1), @(950, 0), @(1250, 0), @(1450, 1))))
+  foreach ($p in [Windows.Media.ScaleTransform]::ScaleXProperty, [Windows.Media.ScaleTransform]::ScaleYProperty) {
+    $ui.Bump.BeginAnimation($p, (Keys B @(@(0, 1), @(1251, 1), @(1252, 0.5), @(1500, 1.12, 'EaseOut'), @(1650, 1))))
   }
 }
 
@@ -155,9 +189,10 @@ function New-Text($text, $size, $color, $bold) {
   $t
 }
 
-function Add-Row($a, $withAck, $acked) {
+function Add-Row($a, $withAck, $acked, $withDismiss) {
   $st = $STATES["$($a.state)"]
   if (-not $st) { $st = @{ label = "$($a.state)"; color = '#8E5CF7'; order = 3 } }
+  if (Is-Dismissed $a) { $st = @{ label = '已标记完成'; color = $STATES.done.color } }
   $s = $summary[$a.sessionId]
 
   $grid = New-Object Windows.Controls.Grid
@@ -194,16 +229,25 @@ function Add-Row($a, $withAck, $acked) {
     $btn.Add_Click({ param($sender, $e) $acks[$sender.Tag.id] = (State-Key $sender.Tag); Save-Acks; Render })
     [Windows.Controls.Grid]::SetColumn($btn, 2); [void]$grid.Children.Add($btn)
   }
+  if ($withDismiss) {
+    $btn = New-Object Windows.Controls.Button
+    $btn.Content = '标记完成'; $btn.FontSize = 11; $btn.Padding = '8,2'; $btn.Margin = '8,0,0,0'
+    $btn.VerticalAlignment = 'Top'; $btn.Cursor = 'Hand'; $btn.Tag = $a; $btn.ToolTip = '不再算作未完成；这个会话有新动静时会重新出现'
+    [Windows.Automation.AutomationProperties]::SetName($btn, "标记完成 $($a.name)")
+    $btn.Background = Brush '#EEF7F0'; $btn.BorderBrush = Brush '#8FD1A0'; $btn.Foreground = Brush '#1F6E36'
+    $btn.Add_Click({ param($sender, $e) $acks[$sender.Tag.id] = "dismiss|$($sender.Tag.state)"; Save-Acks; Render })
+    [Windows.Controls.Grid]::SetColumn($btn, 2); [void]$grid.Children.Add($btn)
+  }
   [void]$ui.List.Children.Add($grid)
 }
 
 function Render {
   $list = @($script:agents | Sort-Object { $o = $STATES["$($_.state)"]; if ($o) { $o.order } else { 3 } }, { -[double]$_.startedAt })
   # 未完成 = 不是 done 的（需要你决策、进行中、其他）；已完成的只列还没点「我知道了」的
-  $unfinished = @($list | Where-Object { $_.state -ne 'done' })
+  $unfinished = @($list | Where-Object { $_.state -ne 'done' -and -not (Is-Dismissed $_) })
   $blocked = @($unfinished | Where-Object { $_.state -eq 'blocked' }).Count
   $doneNew = @($list | Where-Object { $_.state -eq 'done' -and -not (Is-Acked $_) })
-  $doneAcked = @($list | Where-Object { $_.state -eq 'done' -and (Is-Acked $_) })
+  $doneAcked = @($list | Where-Object { ($_.state -eq 'done' -and (Is-Acked $_)) -or (Is-Dismissed $_) })
 
   # 角标 = 未完成会话数（有人等你决策时红色，否则蓝色）；不跳动、不自动弹气泡
   $ui.Badge.Visibility = $(if ($unfinished.Count) { 'Visible' } else { 'Collapsed' })
@@ -220,7 +264,7 @@ function Render {
   $ui.BubbleTitle.Text = "未完成会话 · $($unfinished.Count)" + $(if ($blocked) { "（$blocked 个在等你）" } else { '' })
   $ui.BubbleText.Text = $(if (-not $script:agentsOk) { '正在读取会话列表…' } elseif (-not $unfinished.Count) { '没有未完成的会话' } else { '' })
   $ui.BubbleText.Visibility = $(if ($ui.BubbleText.Text) { 'Visible' } else { 'Collapsed' })
-  foreach ($a in $unfinished) { Add-Row $a $false $false }
+  foreach ($a in $unfinished) { Add-Row $a $false $false $true }
   if ($doneNew.Count) {
     [void]$ui.List.Children.Add((New-Section "刚完成 · $($doneNew.Count)"))
     foreach ($a in $doneNew) { Add-Row $a $true $false }
@@ -244,6 +288,10 @@ function Name-Of($sessionId, $project) {
 function Handle($e) {
   $sid = $e.session; $t = "$($e.text)"
   $name = Name-Of $sid $e.project
+  if ($e.event -in 'Notification', 'UserPromptSubmit') {
+    $a = $script:agents | Where-Object { $_.sessionId -eq $sid } | Select-Object -First 1
+    if ($a -and "$($acks[$a.id])".StartsWith('dismiss|')) { $acks.Remove($a.id); Save-Acks }
+  }
   switch ($e.event) {
     'Notification' {
       $summary[$sid] = @{ text = $(if ($t) { $t } else { '在等你回复' }); ts = $e.ts }
@@ -329,17 +377,39 @@ $ui.Pet.Add_MouseLeftButtonDown({
   $x0 = $win.Left; $y0 = $win.Top
   try { $win.DragMove() } catch { }
   if ([Math]::Abs($win.Left - $x0) -lt 4 -and [Math]::Abs($win.Top - $y0) -lt 4) {
-    $script:open = -not $script:open; $script:flash = $null; Render
+    $script:open = -not $script:open; $script:flash = $null; Render; Launch
   }
   $e.Handled = $true
 })
+
+# 鼠标从远处进到火箭约 110 像素以内时发射一次（窗口外的鼠标收不到事件，只能轮询光标位置）
+Add-Type @'
+using System; using System.Runtime.InteropServices;
+public static class PetCursor {
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+  [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+}
+'@
+$script:near = $true
+$nearTimer = New-Object Windows.Threading.DispatcherTimer
+$nearTimer.Interval = [TimeSpan]::FromMilliseconds(120)
+$nearTimer.Add_Tick({
+  try {
+    $c = $ui.Pet.PointToScreen((New-Object Windows.Point 48, 46))
+    $p = New-Object PetCursor+POINT; [void][PetCursor]::GetCursorPos([ref]$p)
+    $near = [Math]::Sqrt([Math]::Pow($p.X - $c.X, 2) + [Math]::Pow($p.Y - $c.Y, 2)) -lt 110
+    if ($near -and -not $script:near) { Launch }
+    $script:near = $near
+  } catch { }
+})
+$nearTimer.Start()
 $ui.Footer.Add_MouseLeftButtonUp({ $script:showAcked = -not $script:showAcked; Render })
 
 $menu = New-Object Windows.Controls.ContextMenu
 $miAll = New-Object Windows.Controls.MenuItem; $miAll.Header = '全部标记为知道了'
 $miAll.Add_Click({ foreach ($a in $script:agents) { $acks[$a.id] = (State-Key $a) }; Save-Acks; $script:flash = $null; Render })
 $miQuit = New-Object Windows.Controls.MenuItem; $miQuit.Header = '退出桌宠'
-$miQuit.Add_Click({ $timer.Stop(); $win.Close() })
+$miQuit.Add_Click({ $timer.Stop(); $nearTimer.Stop(); $win.Close() })
 [void]$menu.Items.Add($miAll); [void]$menu.Items.Add($miQuit)
 $ui.Pet.ContextMenu = $menu
 
