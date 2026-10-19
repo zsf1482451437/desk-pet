@@ -1,6 +1,6 @@
 ﻿# Claude Code 桌宠：屏幕角落的小南瓜 + 会话面板。
-# 会话列表以 `claude agents --json` 为准（每 5 秒后台刷新），钩子写的 ~/.desk-pet/events.jsonl 负责即时提醒和每个会话最后一句话的摘要。
-# 左键点南瓜：展开 / 收起面板；面板里点一行跳到该会话，「我知道了」把这一行收起，直到它状态再变或又完成一轮。
+# 会话列表以 `claude agents --json` 为准（每 5 秒后台刷新），钩子写的 ~/.desk-pet/events.jsonl 负责提示音和每个会话最后一句话的摘要；不跳动、不自动弹气泡。
+# 南瓜右上角 = 未完成会话数；左键点南瓜弹出未完成会话列表（下方另列刚完成、未确认的），点任意一行跳到该会话；「我知道了」收起已完成的那一行，直到它又完成一轮。
 # 按住南瓜拖动；右键：清空提醒 / 退出。文件须为 UTF-8 带 BOM（Windows PowerShell 5.1 才能读对中文）。
 param([switch]$Open)
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
@@ -94,11 +94,6 @@ function State-Key($a) {
 function Is-Acked($a) { $acks[$a.id] -eq (State-Key $a) }
 
 # ---------------------------------------------------------------- 南瓜表情
-$hopAnim = New-Object Windows.Media.Animation.DoubleAnimation(0, -14, [TimeSpan]::FromMilliseconds(260))
-$hopAnim.AutoReverse = $true
-$hopAnim.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever
-$hopAnim.EasingFunction = New-Object Windows.Media.Animation.QuadraticEase
-$script:hopping = $false
 function Set-Mood($mood) {
   switch ($mood) {
     'alert' { $ui.Mouth.Data = [Windows.Media.Geometry]::Parse('M36,66 Q48,58 60,66 Q48,74 36,66'); $ui.Glow.Fill = Brush '#AAFF3B30' }
@@ -106,12 +101,6 @@ function Set-Mood($mood) {
     'error' { $ui.Mouth.Data = [Windows.Media.Geometry]::Parse('M34,70 Q48,60 62,70'); $ui.Glow.Fill = Brush '#998E5CF7' }
     'busy'  { $ui.Mouth.Data = [Windows.Media.Geometry]::Parse('M38,66 L58,66'); $ui.Glow.Fill = Brush '#552F7BEA' }
     default { $ui.Mouth.Data = [Windows.Media.Geometry]::Parse('M32,64 Q48,76 64,64'); $ui.Glow.Fill = Brush '#00FF8A3D' }
-  }
-  $want = $mood -eq 'alert'
-  if ($want -ne $script:hopping) {
-    $script:hopping = $want
-    if ($want) { $ui.Hop.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, $hopAnim) }
-    else { $ui.Hop.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, $null); $ui.Hop.Y = 0 }
   }
 }
 
@@ -145,7 +134,7 @@ function New-Text($text, $size, $color, $bold) {
   $t
 }
 
-function Add-Row($a, $acked) {
+function Add-Row($a, $withAck, $acked) {
   $st = $STATES["$($a.state)"]
   if (-not $st) { $st = @{ label = "$($a.state)"; color = '#8E5CF7'; order = 3 } }
   $s = $summary[$a.sessionId]
@@ -176,7 +165,7 @@ function Add-Row($a, $acked) {
   $mid.Add_MouseLeftButtonUp({ param($sender, $e) Jump $sender.Tag; $e.Handled = $true })
   [Windows.Controls.Grid]::SetColumn($mid, 1); [void]$grid.Children.Add($mid)
 
-  if (-not $acked) {
+  if ($withAck) {
     $btn = New-Object Windows.Controls.Button
     $btn.Content = '我知道了'; $btn.FontSize = 11; $btn.Padding = '8,2'; $btn.Margin = '8,0,0,0'
     $btn.VerticalAlignment = 'Top'; $btn.Cursor = 'Hand'; $btn.Tag = $a
@@ -189,46 +178,43 @@ function Add-Row($a, $acked) {
 
 function Render {
   $list = @($script:agents | Sort-Object { $o = $STATES["$($_.state)"]; if ($o) { $o.order } else { 3 } }, { -[double]$_.startedAt })
-  $visible = @($list | Where-Object { -not (Is-Acked $_) })
-  $blocked = @($visible | Where-Object { $_.state -eq 'blocked' }).Count
-  $working = @($list | Where-Object { $_.state -eq 'working' }).Count
-  $doneNew = @($visible | Where-Object { $_.state -eq 'done' }).Count
+  # 未完成 = 不是 done 的（需要你决策、进行中、其他）；已完成的只列还没点「我知道了」的
+  $unfinished = @($list | Where-Object { $_.state -ne 'done' })
+  $blocked = @($unfinished | Where-Object { $_.state -eq 'blocked' }).Count
+  $doneNew = @($list | Where-Object { $_.state -eq 'done' -and -not (Is-Acked $_) })
+  $doneAcked = @($list | Where-Object { $_.state -eq 'done' -and (Is-Acked $_) })
 
-  # 南瓜：有人等你 → 跳 + 红；否则有新完成 → 绿；有在跑的 → 蓝；都没有 → 平静
-  $ui.Badge.Visibility = $(if ($blocked) { 'Visible' } else { 'Collapsed' }); $ui.BadgeText.Text = "$blocked"
-  $flash = $script:flash
-  if ($flash -and [datetime]::Now -gt $flash.until) { $script:flash = $null; $flash = $null }
+  # 角标 = 未完成会话数（有人等你决策时红色，否则蓝色）；不跳动、不自动弹气泡
+  $ui.Badge.Visibility = $(if ($unfinished.Count) { 'Visible' } else { 'Collapsed' })
+  $ui.BadgeText.Text = "$($unfinished.Count)"
+  $ui.Badge.Background = Brush $(if ($blocked) { '#E5322D' } else { '#2F7BEA' })
   if ($blocked) { Set-Mood 'alert' }
-  elseif ($flash -and $flash.kind -eq 'error') { Set-Mood 'error' }
-  elseif ($doneNew) { Set-Mood 'done' }
-  elseif ($working) { Set-Mood 'busy' }
+  elseif ($unfinished.Count) { Set-Mood 'busy' }
+  elseif ($doneNew.Count) { Set-Mood 'done' }
   else { Set-Mood 'idle' }
 
   $ui.List.Children.Clear()
-  if ($script:open) {
-    $ui.Bubble.BorderBrush = Brush $(if ($blocked) { '#E5322D' } else { '#FF8A3D' })
-    $parts = @(); if ($blocked) { $parts += "$blocked 个在等你" }; if ($working) { $parts += "$working 个进行中" }; if ($doneNew) { $parts += "$doneNew 个刚完成" }
-    $ui.BubbleTitle.Text = '会话' + $(if ($parts) { ' · ' + ($parts -join ' · ') } else { '' })
-    $ui.BubbleText.Text = $(if (-not $script:agentsOk) { '正在读取会话列表…' } elseif (-not $list) { '没有活跃的会话' } else { '' })
-    $ui.BubbleText.Visibility = $(if ($ui.BubbleText.Text) { 'Visible' } else { 'Collapsed' })
-    foreach ($a in $visible) { Add-Row $a $false }
-    $ackedList = @($list | Where-Object { Is-Acked $_ })
-    if ($script:showAcked) { foreach ($a in $ackedList) { Add-Row $a $true } }
-    $ui.Footer.Text = $(if ($ackedList.Count) { $(if ($script:showAcked) { '收起已知道的' } else { "显示已知道的（$($ackedList.Count)）" }) } else { '' })
-    $ui.Footer.Visibility = $(if ($ui.Footer.Text) { 'Visible' } else { 'Collapsed' })
-    $ui.Scroll.Visibility = 'Visible'
-    $ui.Bubble.Visibility = 'Visible'
-  } elseif ($flash) {
-    $ui.Bubble.BorderBrush = Brush $(switch ($flash.kind) { 'alert' { '#E5322D' } 'error' { '#8E5CF7' } default { '#34C759' } })
-    $ui.BubbleTitle.Text = $flash.title
-    $ui.BubbleText.Text = $flash.text; $ui.BubbleText.Visibility = 'Visible'
-    $ui.Scroll.Visibility = 'Collapsed'; $ui.Footer.Visibility = 'Collapsed'
-    $ui.Bubble.Visibility = 'Visible'
-  } else {
-    $ui.Bubble.Visibility = 'Collapsed'
+  if (-not $script:open) { $ui.Bubble.Visibility = 'Collapsed'; return }
+  $ui.Bubble.BorderBrush = Brush $(if ($blocked) { '#E5322D' } else { '#FF8A3D' })
+  $ui.BubbleTitle.Text = "未完成会话 · $($unfinished.Count)" + $(if ($blocked) { "（$blocked 个在等你）" } else { '' })
+  $ui.BubbleText.Text = $(if (-not $script:agentsOk) { '正在读取会话列表…' } elseif (-not $unfinished.Count) { '没有未完成的会话' } else { '' })
+  $ui.BubbleText.Visibility = $(if ($ui.BubbleText.Text) { 'Visible' } else { 'Collapsed' })
+  foreach ($a in $unfinished) { Add-Row $a $false $false }
+  if ($doneNew.Count) {
+    [void]$ui.List.Children.Add((New-Section "刚完成 · $($doneNew.Count)"))
+    foreach ($a in $doneNew) { Add-Row $a $true $false }
   }
+  if ($script:showAcked) { foreach ($a in $doneAcked) { Add-Row $a $false $true } }
+  $ui.Footer.Text = $(if ($doneAcked.Count) { $(if ($script:showAcked) { '收起已知道的' } else { "显示已知道的（$($doneAcked.Count)）" }) } else { '' })
+  $ui.Footer.Visibility = $(if ($ui.Footer.Text) { 'Visible' } else { 'Collapsed' })
+  $ui.Bubble.Visibility = 'Visible'
 }
 
+function New-Section($text) {
+  $t = New-Text $text 12 '#2E9E4F' $true
+  $t.Margin = '0,10,0,2'
+  $t
+}
 # ---------------------------------------------------------------- 钩子事件：即时提醒 + 摘要
 function Name-Of($sessionId, $project) {
   $a = $script:agents | Where-Object { $_.sessionId -eq $sessionId } | Select-Object -First 1
