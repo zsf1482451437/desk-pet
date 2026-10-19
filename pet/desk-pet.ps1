@@ -1,7 +1,17 @@
-﻿# Claude Code 桌宠：读 ~/.desk-pet/events.jsonl（由 hook/report.mjs 写入），在屏幕角落提醒会话状态。
-# 需要决策 → 跳动 + 红色气泡 + 提示音，直到该会话继续或你点掉；完成 / 出错 → 气泡几秒后自动收起。
-# 左键点南瓜：展开 / 收起列表；拖动：按住南瓜拖；右键：清空 / 退出。
-Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
+﻿# Claude Code 桌宠：屏幕角落的小南瓜 + 会话面板。
+# 会话列表以 `claude agents --json` 为准（每 5 秒后台刷新），钩子写的 ~/.desk-pet/events.jsonl 负责即时提醒和每个会话最后一句话的摘要。
+# 左键点南瓜：展开 / 收起面板；面板里点一行跳到该会话，「我知道了」把这一行收起，直到它状态再变或又完成一轮。
+# 按住南瓜拖动；右键：清空提醒 / 退出。文件须为 UTF-8 带 BOM（Windows PowerShell 5.1 才能读对中文）。
+param([switch]$Open)
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+Add-Type @'
+using System; using System.Runtime.InteropServices;
+public static class PetWin {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+}
+'@
 
 $created = $false
 $mutex = New-Object System.Threading.Mutex($true, 'Global\ClaudeDeskPet', [ref]$created)
@@ -9,21 +19,27 @@ if (-not $created) { exit }
 
 $Dir = Join-Path $env:USERPROFILE '.desk-pet'
 $File = Join-Path $Dir 'events.jsonl'
+$AckFile = Join-Path $Dir 'acks.json'
 New-Item -ItemType Directory -Force $Dir | Out-Null
+$Claude = (Get-Command claude -ErrorAction SilentlyContinue).Source
+if (-not $Claude) { $Claude = Join-Path $env:USERPROFILE '.local\bin\claude.exe' }
 
 [xml]$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize" SizeToContent="WidthAndHeight">
-  <StackPanel x:Name="Root" HorizontalAlignment="Right">
-    <Border x:Name="Bubble" Visibility="Collapsed" CornerRadius="12" Padding="12,9" Margin="0,0,0,6"
-            MaxWidth="300" HorizontalAlignment="Right" Background="#F2FFFFFF" BorderThickness="2" BorderBrush="#FF8A3D">
-      <Border.Effect><DropShadowEffect BlurRadius="12" ShadowDepth="2" Opacity="0.25"/></Border.Effect>
+  <StackPanel HorizontalAlignment="Right">
+    <Border x:Name="Bubble" Visibility="Collapsed" CornerRadius="12" Padding="12,10" Margin="0,0,0,6"
+            Width="380" HorizontalAlignment="Right" Background="#F7FFFFFF" BorderThickness="2" BorderBrush="#FF8A3D">
+      <Border.Effect><DropShadowEffect BlurRadius="14" ShadowDepth="2" Opacity="0.25"/></Border.Effect>
       <StackPanel>
         <TextBlock x:Name="BubbleTitle" FontSize="13" FontWeight="Bold" Foreground="#3A2A1A" TextWrapping="Wrap"/>
         <TextBlock x:Name="BubbleText" FontSize="12" Foreground="#5A4A3A" TextWrapping="Wrap" Margin="0,3,0,0"/>
-        <StackPanel x:Name="List" Margin="0,4,0,0"/>
+        <ScrollViewer x:Name="Scroll" MaxHeight="440" VerticalScrollBarVisibility="Auto" Margin="0,4,0,0">
+          <StackPanel x:Name="List"/>
+        </ScrollViewer>
+        <TextBlock x:Name="Footer" FontSize="11" Foreground="#8A7A6A" HorizontalAlignment="Right" Margin="0,6,0,0" Cursor="Hand"/>
       </StackPanel>
     </Border>
     <Grid x:Name="Pet" Width="96" Height="92" HorizontalAlignment="Right" Cursor="Hand" Background="Transparent">
@@ -34,10 +50,10 @@ New-Item -ItemType Directory -Force $Dir | Out-Null
       <Path Data="M46,16 C46,8 50,4 56,2 L58,6 C54,8 52,11 52,17 Z" Fill="#4E7A2E"/>
       <Ellipse Width="44" Height="64" Margin="8,22,0,0" HorizontalAlignment="Left" VerticalAlignment="Top" Fill="#F07A1E"/>
       <Ellipse Width="44" Height="64" Margin="0,22,8,0" HorizontalAlignment="Right" VerticalAlignment="Top" Fill="#F07A1E"/>
-      <Ellipse x:Name="Body" Width="52" Height="68" Margin="0,20,0,0" HorizontalAlignment="Center" VerticalAlignment="Top" Fill="#FF8A2A"/>
+      <Ellipse Width="52" Height="68" Margin="0,20,0,0" HorizontalAlignment="Center" VerticalAlignment="Top" Fill="#FF8A2A"/>
       <Canvas>
-        <Polygon x:Name="EyeL" Points="30,44 38,52 22,52" Fill="#3A1A08"/>
-        <Polygon x:Name="EyeR" Points="66,44 74,52 58,52" Fill="#3A1A08"/>
+        <Polygon Points="30,44 38,52 22,52" Fill="#3A1A08"/>
+        <Polygon Points="66,44 74,52 58,52" Fill="#3A1A08"/>
         <Path x:Name="Mouth" Data="M32,64 Q48,76 64,64" Stroke="#3A1A08" StrokeThickness="4" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
       </Canvas>
       <Border x:Name="Badge" Visibility="Collapsed" Width="24" Height="24" CornerRadius="12" Background="#E5322D"
@@ -50,114 +66,200 @@ New-Item -ItemType Directory -Force $Dir | Out-Null
 '@
 $win = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
 $ui = @{}
-foreach ($n in 'Bubble', 'BubbleTitle', 'BubbleText', 'List', 'Pet', 'Hop', 'Glow', 'Body', 'EyeL', 'EyeR', 'Mouth', 'Badge', 'BadgeText') { $ui[$n] = $win.FindName($n) }
-
-$brush = { param($hex) New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($hex)) }
+foreach ($n in 'Bubble', 'BubbleTitle', 'BubbleText', 'Scroll', 'List', 'Footer', 'Pet', 'Hop', 'Glow', 'Mouth', 'Badge', 'BadgeText') { $ui[$n] = $win.FindName($n) }
+function Brush($hex) { New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($hex)) }
 
 # ---------------------------------------------------------------- 状态
-$waiting = [ordered]@{}           # session -> @{ project; text; ts }
-$recent = New-Object System.Collections.ArrayList   # 最近完成 / 出错，最多 6 条
-$script:offset = 0
-$script:flashUntil = [datetime]::MinValue
-$script:flashKind = ''
-$script:listOpen = $false
-if (Test-Path $File) { $script:offset = (Get-Item $File).Length }   # 启动前的旧事件不提醒
-
-function Set-Face($mood) {
-  switch ($mood) {
-    'alert' { $ui.Mouth.Data = [Windows.Media.Geometry]::Parse('M36,66 Q48,58 60,66 Q48,74 36,66'); $ui.Glow.Fill = & $brush '#AAFF3B30' }
-    'done'  { $ui.Mouth.Data = [Windows.Media.Geometry]::Parse('M30,62 Q48,80 66,62'); $ui.Glow.Fill = & $brush '#9934C759' }
-    'error' { $ui.Mouth.Data = [Windows.Media.Geometry]::Parse('M34,70 Q48,60 62,70'); $ui.Glow.Fill = & $brush '#998E5CF7' }
-    default { $ui.Mouth.Data = [Windows.Media.Geometry]::Parse('M32,64 Q48,76 64,64'); $ui.Glow.Fill = & $brush '#00FF8A3D' }
-  }
+$STATES = @{
+  blocked = @{ label = '需要你决策'; color = '#E5322D'; order = 0 }
+  working = @{ label = '进行中'; color = '#2F7BEA'; order = 1 }
+  done    = @{ label = '已完成'; color = '#2E9E4F'; order = 2 }
 }
+$script:agents = @()             # 最近一次 claude agents --json 的结果
+$script:agentsOk = $false
+$summary = @{}                   # sessionId -> @{ text; ts; event }
+$acks = @{}                      # 会话 id -> 确认时的状态键
+if (Test-Path $AckFile) { try { (Get-Content $AckFile -Raw -Encoding UTF8 | ConvertFrom-Json).PSObject.Properties | % { $acks[$_.Name] = $_.Value } } catch { } }
+$script:offset = 0
+if (Test-Path $File) { $script:offset = (Get-Item $File).Length }   # 启动前的旧事件不提醒
+$script:open = [bool]$Open
+$script:showAcked = $false
+$script:flash = $null            # 即时提醒气泡 @{ title; text; kind; until }
 
+function Save-Acks { try { ($acks | ConvertTo-Json -Compress) | Set-Content $AckFile -Encoding UTF8 } catch { } }
+function State-Key($a) {
+  $s = $summary[$a.sessionId]
+  "$($a.state)|$(if ($s) { $s.ts } else { 0 })"
+}
+function Is-Acked($a) { $acks[$a.id] -eq (State-Key $a) }
+
+# ---------------------------------------------------------------- 南瓜表情
 $hopAnim = New-Object Windows.Media.Animation.DoubleAnimation(0, -14, [TimeSpan]::FromMilliseconds(260))
 $hopAnim.AutoReverse = $true
 $hopAnim.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever
 $hopAnim.EasingFunction = New-Object Windows.Media.Animation.QuadraticEase
-function Start-Hop { $ui.Hop.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, $hopAnim) }
-function Stop-Hop { $ui.Hop.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, $null); $ui.Hop.Y = 0 }
-
-function Add-Row($text, $color, $session) {
-  $tb = New-Object Windows.Controls.TextBlock
-  $tb.Text = $text; $tb.FontSize = 12; $tb.TextWrapping = 'Wrap'; $tb.Margin = '0,3,0,0'
-  $tb.Foreground = & $brush $color
-  if ($session) {
-    $tb.Cursor = 'Hand'; $tb.ToolTip = '点一下：标记已处理'
-    $tb.Tag = $session
-    $tb.Add_MouseLeftButtonUp({ param($s, $e) $waiting.Remove($s.Tag); Render; $e.Handled = $true })
+$script:hopping = $false
+function Set-Mood($mood) {
+  switch ($mood) {
+    'alert' { $ui.Mouth.Data = [Windows.Media.Geometry]::Parse('M36,66 Q48,58 60,66 Q48,74 36,66'); $ui.Glow.Fill = Brush '#AAFF3B30' }
+    'done'  { $ui.Mouth.Data = [Windows.Media.Geometry]::Parse('M30,62 Q48,80 66,62'); $ui.Glow.Fill = Brush '#9934C759' }
+    'error' { $ui.Mouth.Data = [Windows.Media.Geometry]::Parse('M34,70 Q48,60 62,70'); $ui.Glow.Fill = Brush '#998E5CF7' }
+    'busy'  { $ui.Mouth.Data = [Windows.Media.Geometry]::Parse('M38,66 L58,66'); $ui.Glow.Fill = Brush '#552F7BEA' }
+    default { $ui.Mouth.Data = [Windows.Media.Geometry]::Parse('M32,64 Q48,76 64,64'); $ui.Glow.Fill = Brush '#00FF8A3D' }
   }
-  [void]$ui.List.Children.Add($tb)
+  $want = $mood -eq 'alert'
+  if ($want -ne $script:hopping) {
+    $script:hopping = $want
+    if ($want) { $ui.Hop.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, $hopAnim) }
+    else { $ui.Hop.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, $null); $ui.Hop.Y = 0 }
+  }
+}
+
+# ---------------------------------------------------------------- 跳转
+function Jump($a) {
+  try {
+    if ($a.kind -eq 'background' -or -not $a.pid) {
+      # 后台会话：开一个 PowerShell 窗口接入（← 回到 agent 视图，Ctrl+Z 回 shell，会话照常运行）
+      Start-Process powershell.exe -ArgumentList @('-NoExit', '-Command', "& '$Claude' attach $($a.id)") -WorkingDirectory $(if (Test-Path $a.cwd) { $a.cwd } else { $env:USERPROFILE })
+      return
+    }
+    # 交互式会话：沿父进程往上找第一个有窗口的（终端 / IDE），切到前台
+    $id = [int]$a.pid
+    for ($i = 0; $i -lt 8 -and $id; $i++) {
+      $p = Get-Process -Id $id -ErrorAction SilentlyContinue
+      if ($p -and $p.MainWindowHandle -ne [IntPtr]::Zero) {
+        if ([PetWin]::IsIconic($p.MainWindowHandle)) { [void][PetWin]::ShowWindow($p.MainWindowHandle, 9) }
+        [void][PetWin]::SetForegroundWindow($p.MainWindowHandle)
+        return
+      }
+      $id = (Get-CimInstance Win32_Process -Filter "ProcessId=$id" -ErrorAction SilentlyContinue).ParentProcessId
+    }
+  } catch { }
+}
+
+# ---------------------------------------------------------------- 面板
+function New-Text($text, $size, $color, $bold) {
+  $t = New-Object Windows.Controls.TextBlock
+  $t.Text = $text; $t.FontSize = $size; $t.Foreground = Brush $color; $t.TextWrapping = 'Wrap'
+  if ($bold) { $t.FontWeight = 'Bold' }
+  $t
+}
+
+function Add-Row($a, $acked) {
+  $st = $STATES["$($a.state)"]
+  if (-not $st) { $st = @{ label = "$($a.state)"; color = '#8E5CF7'; order = 3 } }
+  $s = $summary[$a.sessionId]
+
+  $grid = New-Object Windows.Controls.Grid
+  $grid.Margin = '0,4,0,4'
+  $grid.Opacity = $(if ($acked) { 0.55 } else { 1 })
+  $c1 = New-Object Windows.Controls.ColumnDefinition; $c1.Width = 'Auto'
+  $c2 = New-Object Windows.Controls.ColumnDefinition; $c2.Width = '*'
+  $c3 = New-Object Windows.Controls.ColumnDefinition; $c3.Width = 'Auto'
+  $grid.ColumnDefinitions.Add($c1); $grid.ColumnDefinitions.Add($c2); $grid.ColumnDefinitions.Add($c3)
+
+  $dot = New-Object Windows.Shapes.Ellipse
+  $dot.Width = 10; $dot.Height = 10; $dot.Fill = Brush $st.color; $dot.Margin = '0,4,8,0'; $dot.VerticalAlignment = 'Top'
+  [Windows.Controls.Grid]::SetColumn($dot, 0); [void]$grid.Children.Add($dot)
+
+  $mid = New-Object Windows.Controls.StackPanel
+  $mid.Cursor = 'Hand'; $mid.Background = Brush '#00FFFFFF'; $mid.ToolTip = '点击跳到这个会话'; $mid.Tag = $a
+  $head = New-Object Windows.Controls.TextBlock
+  $head.TextWrapping = 'Wrap'
+  $r1 = New-Object Windows.Documents.Run ($st.label + '  '); $r1.Foreground = Brush $st.color; $r1.FontWeight = 'Bold'; $r1.FontSize = 12
+  $r2 = New-Object Windows.Documents.Run ("$($a.name)"); $r2.Foreground = Brush '#2A1E14'; $r2.FontWeight = 'Bold'; $r2.FontSize = 13
+  $head.Inlines.Add($r1); $head.Inlines.Add($r2)
+  [void]$mid.Children.Add($head)
+  $proj = Split-Path $a.cwd -Leaf
+  $line = $proj + $(if ($s -and $s.text) { ' · ' + $s.text } else { '' })
+  [void]$mid.Children.Add((New-Text $line 11 '#6A5A4A' $false))
+  $mid.Add_MouseLeftButtonUp({ param($sender, $e) Jump $sender.Tag; $e.Handled = $true })
+  [Windows.Controls.Grid]::SetColumn($mid, 1); [void]$grid.Children.Add($mid)
+
+  if (-not $acked) {
+    $btn = New-Object Windows.Controls.Button
+    $btn.Content = '我知道了'; $btn.FontSize = 11; $btn.Padding = '8,2'; $btn.Margin = '8,0,0,0'
+    $btn.VerticalAlignment = 'Top'; $btn.Cursor = 'Hand'; $btn.Tag = $a
+    $btn.Background = Brush '#FFF3E8'; $btn.BorderBrush = Brush '#FFB27A'; $btn.Foreground = Brush '#8A4A14'
+    $btn.Add_Click({ param($sender, $e) $acks[$sender.Tag.id] = (State-Key $sender.Tag); Save-Acks; Render })
+    [Windows.Controls.Grid]::SetColumn($btn, 2); [void]$grid.Children.Add($btn)
+  }
+  [void]$ui.List.Children.Add($grid)
 }
 
 function Render {
+  $list = @($script:agents | Sort-Object { $o = $STATES["$($_.state)"]; if ($o) { $o.order } else { 3 } }, { -[double]$_.startedAt })
+  $visible = @($list | Where-Object { -not (Is-Acked $_) })
+  $blocked = @($visible | Where-Object { $_.state -eq 'blocked' }).Count
+  $working = @($list | Where-Object { $_.state -eq 'working' }).Count
+  $doneNew = @($visible | Where-Object { $_.state -eq 'done' }).Count
+
+  # 南瓜：有人等你 → 跳 + 红；否则有新完成 → 绿；有在跑的 → 蓝；都没有 → 平静
+  $ui.Badge.Visibility = $(if ($blocked) { 'Visible' } else { 'Collapsed' }); $ui.BadgeText.Text = "$blocked"
+  $flash = $script:flash
+  if ($flash -and [datetime]::Now -gt $flash.until) { $script:flash = $null; $flash = $null }
+  if ($blocked) { Set-Mood 'alert' }
+  elseif ($flash -and $flash.kind -eq 'error') { Set-Mood 'error' }
+  elseif ($doneNew) { Set-Mood 'done' }
+  elseif ($working) { Set-Mood 'busy' }
+  else { Set-Mood 'idle' }
+
   $ui.List.Children.Clear()
-  $n = $waiting.Count
-  if ($n -gt 0) {
-    $ui.Badge.Visibility = 'Visible'; $ui.BadgeText.Text = "$n"
-    Set-Face 'alert'; Start-Hop
-    $first = @($waiting.Values)[-1]
-    $ui.Bubble.BorderBrush = & $brush '#E5322D'
-    $ui.BubbleTitle.Text = "需要你决策 · $($first.project)" + $(if ($n -gt 1) { "（共 $n 个会话）" } else { '' })
-    $ui.BubbleText.Text = $first.text
+  if ($script:open) {
+    $ui.Bubble.BorderBrush = Brush $(if ($blocked) { '#E5322D' } else { '#FF8A3D' })
+    $parts = @(); if ($blocked) { $parts += "$blocked 个在等你" }; if ($working) { $parts += "$working 个进行中" }; if ($doneNew) { $parts += "$doneNew 个刚完成" }
+    $ui.BubbleTitle.Text = '会话' + $(if ($parts) { ' · ' + ($parts -join ' · ') } else { '' })
+    $ui.BubbleText.Text = $(if (-not $script:agentsOk) { '正在读取会话列表…' } elseif (-not $list) { '没有活跃的会话' } else { '' })
+    $ui.BubbleText.Visibility = $(if ($ui.BubbleText.Text) { 'Visible' } else { 'Collapsed' })
+    foreach ($a in $visible) { Add-Row $a $false }
+    $ackedList = @($list | Where-Object { Is-Acked $_ })
+    if ($script:showAcked) { foreach ($a in $ackedList) { Add-Row $a $true } }
+    $ui.Footer.Text = $(if ($ackedList.Count) { $(if ($script:showAcked) { '收起已知道的' } else { "显示已知道的（$($ackedList.Count)）" }) } else { '' })
+    $ui.Footer.Visibility = $(if ($ui.Footer.Text) { 'Visible' } else { 'Collapsed' })
+    $ui.Scroll.Visibility = 'Visible'
     $ui.Bubble.Visibility = 'Visible'
-    if ($script:listOpen) { foreach ($k in @($waiting.Keys)) { $w = $waiting[$k]; Add-Row ("● $($w.project)：$($w.text)") '#B3261E' $k } }
-    return
-  }
-  $ui.Badge.Visibility = 'Collapsed'; Stop-Hop
-  if ([datetime]::Now -lt $script:flashUntil -and $recent.Count -gt 0) {
-    $r = $recent[0]
-    Set-Face $script:flashKind
-    $ui.Bubble.BorderBrush = & $brush $(if ($script:flashKind -eq 'error') { '#8E5CF7' } else { '#34C759' })
-    $ui.BubbleTitle.Text = $r.title
-    $ui.BubbleText.Text = $r.text
-    $ui.Bubble.Visibility = 'Visible'
-  } elseif ($script:listOpen) {
-    Set-Face 'idle'
-    $ui.Bubble.BorderBrush = & $brush '#FF8A3D'
-    $ui.BubbleTitle.Text = if ($recent.Count) { '最近动态' } else { '一切安静' }
-    $ui.BubbleText.Text = ''
-    foreach ($r in $recent) { Add-Row ("$($r.time)  $($r.title)") '#5A4A3A' $null }
+  } elseif ($flash) {
+    $ui.Bubble.BorderBrush = Brush $(switch ($flash.kind) { 'alert' { '#E5322D' } 'error' { '#8E5CF7' } default { '#34C759' } })
+    $ui.BubbleTitle.Text = $flash.title
+    $ui.BubbleText.Text = $flash.text; $ui.BubbleText.Visibility = 'Visible'
+    $ui.Scroll.Visibility = 'Collapsed'; $ui.Footer.Visibility = 'Collapsed'
     $ui.Bubble.Visibility = 'Visible'
   } else {
-    Set-Face 'idle'; $ui.Bubble.Visibility = 'Collapsed'
+    $ui.Bubble.Visibility = 'Collapsed'
   }
 }
 
-function Push-Recent($title, $text, $kind) {
-  [void]$recent.Insert(0, @{ title = $title; text = $text; time = (Get-Date -Format 'HH:mm') })
-  while ($recent.Count -gt 6) { $recent.RemoveAt($recent.Count - 1) }
-  $script:flashKind = $kind
-  $script:flashUntil = [datetime]::Now.AddSeconds(8)
+# ---------------------------------------------------------------- 钩子事件：即时提醒 + 摘要
+function Name-Of($sessionId, $project) {
+  $a = $script:agents | Where-Object { $_.sessionId -eq $sessionId } | Select-Object -First 1
+  if ($a) { $a.name } else { $project }
 }
-
 function Handle($e) {
-  $s = $e.session; $p = $e.project; $t = "$($e.text)"
+  $sid = $e.session; $t = "$($e.text)"
+  $name = Name-Of $sid $e.project
   switch ($e.event) {
     'Notification' {
-      $isNew = -not $waiting.Contains($s)
-      $waiting.Remove($s); $waiting[$s] = @{ project = $p; text = $(if ($t) { $t } else { '在等你回复' }) }
-      if ($isNew) { [System.Media.SystemSounds]::Exclamation.Play() }
+      $summary[$sid] = @{ text = $(if ($t) { $t } else { '在等你回复' }); ts = $e.ts }
+      $script:flash = @{ title = "需要你决策 · $name"; text = $summary[$sid].text; kind = 'alert'; until = [datetime]::Now.AddSeconds(10) }
+      [System.Media.SystemSounds]::Exclamation.Play()
     }
-    'UserPromptSubmit' { $waiting.Remove($s) }
     'Stop' {
-      $waiting.Remove($s)
-      Push-Recent "完成 · $p" $(if ($t) { $t } else { '这一轮跑完了' }) 'done'
+      $summary[$sid] = @{ text = $(if ($t) { $t } else { '这一轮跑完了' }); ts = $e.ts }
+      $script:flash = @{ title = "完成 · $name"; text = $summary[$sid].text; kind = 'done'; until = [datetime]::Now.AddSeconds(8) }
       [System.Media.SystemSounds]::Asterisk.Play()
     }
-    'SubagentStop' { Push-Recent "子 agent 完成 · $p" $t 'done' }
-    'PermissionDenied' { Push-Recent "权限被拒 · $p" ("$($e.tool) $t").Trim() 'error'; [System.Media.SystemSounds]::Hand.Play() }
-    'StopFailure' { Push-Recent "出错停下 · $p" $t 'error'; [System.Media.SystemSounds]::Hand.Play() }
-    'PostToolUseFailure' { Push-Recent "工具失败 · $p" ("$($e.tool) $t").Trim() 'error' }
+    'SubagentStop' { $script:flash = @{ title = "子 agent 完成 · $name"; text = $t; kind = 'done'; until = [datetime]::Now.AddSeconds(6) } }
+    'PermissionDenied' { $script:flash = @{ title = "权限被拒 · $name"; text = ("$($e.tool) $t").Trim(); kind = 'error'; until = [datetime]::Now.AddSeconds(8) }; [System.Media.SystemSounds]::Hand.Play() }
+    'StopFailure' { $script:flash = @{ title = "出错停下 · $name"; text = $t; kind = 'error'; until = [datetime]::Now.AddSeconds(8) }; [System.Media.SystemSounds]::Hand.Play() }
+    'PostToolUseFailure' { $script:flash = @{ title = "工具失败 · $name"; text = ("$($e.tool) $t").Trim(); kind = 'error'; until = [datetime]::Now.AddSeconds(5) } }
+    'UserPromptSubmit' { $summary[$sid] = @{ text = '处理中…'; ts = $e.ts } }
   }
 }
 
-# ---------------------------------------------------------------- 读新事件
-function Poll {
+function Poll-Events {
   if (-not (Test-Path $File)) { return }
   $len = (Get-Item $File).Length
-  if ($len -lt $script:offset) { $script:offset = 0 }   # 文件被清空过
+  if ($len -lt $script:offset) { $script:offset = 0 }
   if ($len -eq $script:offset) { return }
   $fs = [IO.File]::Open($File, 'Open', 'Read', 'ReadWrite')
   try {
@@ -167,7 +269,7 @@ function Poll {
   } finally { $fs.Close() }
   $chunk = [Text.Encoding]::UTF8.GetString($buf, 0, $read)
   $cut = $chunk.LastIndexOf("`n")
-  if ($cut -lt 0) { return }                              # 还没写完一整行
+  if ($cut -lt 0) { return }
   $script:offset += [Text.Encoding]::UTF8.GetByteCount($chunk.Substring(0, $cut + 1))
   foreach ($line in $chunk.Substring(0, $cut).Split("`n")) {
     if (-not $line.Trim()) { continue }
@@ -175,9 +277,41 @@ function Poll {
   }
 }
 
+# ---------------------------------------------------------------- claude agents --json（异步，约 1 秒一次调用）
+$script:agentTask = $null
+$script:agentProc = $null
+$script:nextAgents = [datetime]::MinValue
+function Poll-Agents {
+  if ($script:agentTask) {
+    if (-not $script:agentTask.IsCompleted) { return }
+    try {
+      $out = $script:agentTask.Result
+      $parsed = $out | ConvertFrom-Json
+      $script:agents = @($parsed)
+      $script:agentsOk = $true
+      # 已经不在列表里的会话，它的「我知道了」记录就不用留了
+      $ids = @($script:agents | % { $_.id })
+      foreach ($k in @($acks.Keys)) { if ($ids -notcontains $k) { $acks.Remove($k) } }
+    } catch { }
+    try { $script:agentProc.Dispose() } catch { }
+    $script:agentTask = $null
+    $script:nextAgents = [datetime]::Now.AddSeconds(5)
+    Render
+    return
+  }
+  if ([datetime]::Now -lt $script:nextAgents) { return }
+  try {
+    $psi = New-Object Diagnostics.ProcessStartInfo $Claude, 'agents --json'
+    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.CreateNoWindow = $true
+    $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $script:agentProc = [Diagnostics.Process]::Start($psi)
+    $script:agentTask = $script:agentProc.StandardOutput.ReadToEndAsync()
+  } catch { $script:nextAgents = [datetime]::Now.AddSeconds(15) }
+}
+
 $timer = New-Object Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromMilliseconds(700)
-$timer.Add_Tick({ Poll; Render })
+$timer.Add_Tick({ Poll-Events; Poll-Agents; Render })
 $timer.Start()
 
 # ---------------------------------------------------------------- 交互
@@ -187,19 +321,20 @@ $ui.Pet.Add_MouseLeftButtonUp({
   param($s, $e)
   $now = $e.GetPosition($win)
   if ($script:downAt -and [Math]::Abs($now.X - $script:downAt.X) -lt 4 -and [Math]::Abs($now.Y - $script:downAt.Y) -lt 4) {
-    $script:listOpen = -not $script:listOpen; $script:flashUntil = [datetime]::MinValue; Render
+    $script:open = -not $script:open; $script:flash = $null; Render
   }
 })
+$ui.Footer.Add_MouseLeftButtonUp({ $script:showAcked = -not $script:showAcked; Render })
 
 $menu = New-Object Windows.Controls.ContextMenu
-$miClear = New-Object Windows.Controls.MenuItem; $miClear.Header = '清空提醒'
-$miClear.Add_Click({ $waiting.Clear(); $recent.Clear(); $script:flashUntil = [datetime]::MinValue; Render })
+$miAll = New-Object Windows.Controls.MenuItem; $miAll.Header = '全部标记为知道了'
+$miAll.Add_Click({ foreach ($a in $script:agents) { $acks[$a.id] = (State-Key $a) }; Save-Acks; $script:flash = $null; Render })
 $miQuit = New-Object Windows.Controls.MenuItem; $miQuit.Header = '退出桌宠'
 $miQuit.Add_Click({ $timer.Stop(); $win.Close() })
-[void]$menu.Items.Add($miClear); [void]$menu.Items.Add($miQuit)
+[void]$menu.Items.Add($miAll); [void]$menu.Items.Add($miQuit)
 $ui.Pet.ContextMenu = $menu
 
-# 气泡随内容变高时，保持南瓜贴在右下角
+# 面板随内容变高变宽时，南瓜保持贴在原来的右下角
 $win.Add_SizeChanged({
   param($s, $e)
   if ($e.PreviousSize.Width -gt 0) {
@@ -213,6 +348,6 @@ $win.Add_Loaded({
   $win.Top = $wa.Bottom - $win.ActualHeight - 24
 })
 
-Set-Face 'idle'
+Set-Mood 'idle'
 [void]$win.ShowDialog()
 $mutex.ReleaseMutex()
