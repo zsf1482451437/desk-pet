@@ -105,75 +105,35 @@ function Set-Mood($mood) {
 }
 
 # ---------------------------------------------------------------- 跳转
-# 网页版会话都在同一个「桌宠专用」Chrome 应用窗口里切换：独立的浏览器资料目录（首次要在里面登录 claude.ai），
-# 只监听本机的调试端口；窗口在就通过 DevTools 协议让它跳到新地址并切到前台，不在就重新开一个。
-$CdpPort = 9333
-$ChromeProfile = Join-Path $Dir 'chrome-profile'
-$Chrome = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe' -ErrorAction SilentlyContinue).'(default)'
-if (-not $Chrome) { $Chrome = (Get-ItemProperty 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe' -ErrorAction SilentlyContinue).'(default)' }
-
-function Send-Cdp($wsUrl, $method, $params) {
-  $ws = New-Object System.Net.WebSockets.ClientWebSocket
-  $cts = New-Object System.Threading.CancellationTokenSource 3000
-  try {
-    $ws.ConnectAsync([Uri]$wsUrl, $cts.Token).Wait()
-    $msg = @{ id = 1; method = $method; params = $params } | ConvertTo-Json -Compress -Depth 5
-    $bytes = [Text.Encoding]::UTF8.GetBytes($msg)
-    $seg = New-Object System.ArraySegment[byte] -ArgumentList (, $bytes)
-    $ws.SendAsync($seg, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $cts.Token).Wait()
-    $buf = New-Object byte[] 4096
-    $rseg = New-Object System.ArraySegment[byte] -ArgumentList (, $buf)
-    [void]$ws.ReceiveAsync($rseg, $cts.Token).Wait()
-  } finally { try { $ws.Dispose() } catch { } }
-}
-
-function Focus-ClaudeWindow {
-  # 专用窗口的进程命令行里带着我们的资料目录，找有主窗口的那个切到前台
-  $procs = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*$ChromeProfile*" }
-  foreach ($cp in $procs) {
-    $p = Get-Process -Id $cp.ProcessId -ErrorAction SilentlyContinue
-    if ($p -and $p.MainWindowHandle -ne [IntPtr]::Zero) {
-      if ([PetWin]::IsIconic($p.MainWindowHandle)) { [void][PetWin]::ShowWindow($p.MainWindowHandle, 9) }
-      [void][PetWin]::SetForegroundWindow($p.MainWindowHandle)
-      return
+# 后台会话：把浏览器里已经开着的 Claude 标签页切到前台（不切换会话）。用 Windows UI 自动化读 Chrome 的标签栏，
+# 不需要插件或调试端口；有多个 Claude 标签时优先标题里带会话名的。一个都没开时在默认浏览器打开 claude.ai/code。
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+function Activate-ClaudeTab($sessionName) {
+  $root = [Windows.Automation.AutomationElement]::RootElement
+  $isTab = New-Object Windows.Automation.PropertyCondition([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::TabItem)
+  $browserPids = @(Get-Process chrome, msedge -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+  $best = $null; $bestWin = $null
+  foreach ($w in $root.FindAll([Windows.Automation.TreeScope]::Children, [Windows.Automation.Condition]::TrueCondition)) {
+    if ($browserPids -notcontains $w.Current.ProcessId) { continue }
+    foreach ($tab in $w.FindAll([Windows.Automation.TreeScope]::Descendants, $isTab)) {
+      $n = $tab.Current.Name
+      if ($n -notmatch 'Claude') { continue }
+      if (-not $best -or ($sessionName -and $n -like "*$sessionName*")) { $best = $tab; $bestWin = $w }
+      if ($sessionName -and $n -like "*$sessionName*") { break }
     }
   }
-}
-
-function Open-InClaudeWindow($url) {
-  $targets = $null
-  try { $targets = Invoke-RestMethod "http://127.0.0.1:$CdpPort/json" -TimeoutSec 2 } catch { }
-  $page = @($targets) | Where-Object { $_.type -eq 'page' -and $_.url -like 'https://claude.ai/*' } | Select-Object -First 1
-  if (-not $page) { $page = @($targets) | Where-Object { $_.type -eq 'page' } | Select-Object -First 1 }
-  if ($page -and $page.webSocketDebuggerUrl) {
-    try {
-      Send-Cdp $page.webSocketDebuggerUrl 'Page.navigate' @{ url = $url }
-      Send-Cdp $page.webSocketDebuggerUrl 'Page.bringToFront' @{}
-      Focus-ClaudeWindow
-      return
-    } catch { }
+  if (-not $best) { Start-Process 'https://claude.ai/code'; return }
+  try { $best.GetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern).Select() } catch {
+    try { $best.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke() } catch { }
   }
-  if (-not $Chrome) { Start-Process $url; return }   # 没装 Chrome：退回默认浏览器新标签
-  Start-Process $Chrome -ArgumentList @("--user-data-dir=`"$ChromeProfile`"", "--remote-debugging-port=$CdpPort", '--no-first-run', '--no-default-browser-check', '--window-size=1280,900', "--app=$url")
+  $h = [IntPtr]$bestWin.Current.NativeWindowHandle
+  if ([PetWin]::IsIconic($h)) { [void][PetWin]::ShowWindow($h, 9) }
+  [void][PetWin]::SetForegroundWindow($h)
 }
 
 function Jump($a) {
   try {
-    if ($a.kind -eq 'background' -or -not $a.pid) {
-      # 后台会话优先在浏览器打开网页版：~/.claude/jobs/<id>/state.json 的 bridgeSessionId 是 cse_xxx，
-      # 网页地址是 https://claude.ai/code/session_xxx
-      $stateFile = Join-Path $env:USERPROFILE ".claude\jobs\$($a.id)\state.json"
-      if (Test-Path $stateFile) {
-        $bridge = "$(([IO.File]::ReadAllText($stateFile, [Text.Encoding]::UTF8) | ConvertFrom-Json).bridgeSessionId)"
-        if ($bridge -match '^cse_(\w+)$') {
-          Open-InClaudeWindow "https://claude.ai/code/session_$($Matches[1])"
-          return
-        }
-      }
-      # 没连到网页的：开一个 PowerShell 窗口接入（← 回到 agent 视图，Ctrl+Z 回 shell，会话照常运行）
-      Start-Process powershell.exe -ArgumentList @('-NoExit', '-Command', "& '$Claude' attach $($a.id)") -WorkingDirectory $(if (Test-Path $a.cwd) { $a.cwd } else { $env:USERPROFILE })
-      return
-    }
+    if ($a.kind -eq 'background' -or -not $a.pid) { Activate-ClaudeTab $a.name; return }
     # 交互式会话：沿父进程往上找第一个有窗口的（终端 / IDE），切到前台
     $id = [int]$a.pid
     for ($i = 0; $i -lt 8 -and $id; $i++) {
@@ -187,7 +147,6 @@ function Jump($a) {
     }
   } catch { }
 }
-
 # ---------------------------------------------------------------- 面板
 function New-Text($text, $size, $color, $bold) {
   $t = New-Object Windows.Controls.TextBlock
