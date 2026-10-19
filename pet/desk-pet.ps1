@@ -301,14 +301,16 @@ $timer.Add_Tick({ Poll-Events; Poll-Agents; Render })
 $timer.Start()
 
 # ---------------------------------------------------------------- 交互
-$script:downAt = $null
-$ui.Pet.Add_MouseLeftButtonDown({ param($s, $e) $script:downAt = $e.GetPosition($win); $win.DragMove() })
-$ui.Pet.Add_MouseLeftButtonUp({
+# DragMove 会接管鼠标直到松开、吞掉 MouseLeftButtonUp，所以不能靠松开事件判断点击：
+# 它返回时鼠标已松开，窗口没挪动（<4px）就算点击，弹出 / 收起列表
+$ui.Pet.Add_MouseLeftButtonDown({
   param($s, $e)
-  $now = $e.GetPosition($win)
-  if ($script:downAt -and [Math]::Abs($now.X - $script:downAt.X) -lt 4 -and [Math]::Abs($now.Y - $script:downAt.Y) -lt 4) {
+  $x0 = $win.Left; $y0 = $win.Top
+  try { $win.DragMove() } catch { }
+  if ([Math]::Abs($win.Left - $x0) -lt 4 -and [Math]::Abs($win.Top - $y0) -lt 4) {
     $script:open = -not $script:open; $script:flash = $null; Render
   }
+  $e.Handled = $true
 })
 $ui.Footer.Add_MouseLeftButtonUp({ $script:showAcked = -not $script:showAcked; Render })
 
