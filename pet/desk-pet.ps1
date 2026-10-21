@@ -1,5 +1,6 @@
 ﻿# Claude Code 桌宠：屏幕角落的小火箭 + 会话面板。
-# 会话列表以 `claude agents --json` 为准（每 5 秒后台刷新），钩子写的 ~/.desk-pet/events.jsonl 负责提示音和每个会话最后一句话的摘要；不自动弹气泡。
+# 会话列表以 `claude agents --json` 为准（面板展开时每 5 秒刷新；收起时每 60 秒，另在会话状态变化的钩子事件后 2 秒刷新——每次调用要起一个约 300 MB 的 claude 进程），
+# 钩子写的 ~/.desk-pet/events.jsonl 负责提示音、每个会话最后一句话的摘要，以及触发刷新；不自动弹气泡。
 # 火箭右上角 = 未完成会话数；左键点火箭弹出未完成会话列表（下方另列刚完成、未确认的），点任意一行跳到该会话；「我知道了」收起已完成的那一行，直到它又完成一轮；
 # 未完成的行可「标记完成」，该会话有新提醒或新输入时重新出现。点击火箭或鼠标靠近时火箭发射一次。
 # 按住火箭拖动；右键：清空提醒 / 退出。文件须为 UTF-8 带 BOM（Windows PowerShell 5.1 才能读对中文）。
@@ -292,6 +293,8 @@ function Handle($e) {
     $a = $script:agents | Where-Object { $_.sessionId -eq $sid } | Select-Object -First 1
     if ($a -and "$($acks[$a.id])".StartsWith('dismiss|')) { $acks.Remove($a.id); Save-Acks }
   }
+  # 会话状态会变的事件：稍后刷新列表，角标和光晕跟上。子 agent 结束、工具失败不改会话状态，不刷新
+  if ($e.event -in $STATE_EVENTS) { Refresh-AgentsSoon $AGENTS_AFTER_EVENT_SEC }
   switch ($e.event) {
     'Notification' {
       $summary[$sid] = @{ text = $(if ($t) { $t } else { '在等你回复' }); ts = $e.ts }
@@ -333,9 +336,20 @@ function Poll-Events {
 }
 
 # ---------------------------------------------------------------- claude agents --json（异步，约 1 秒一次调用）
+# 每次调用起一个约 300 MB 的 claude 进程，所以只在需要时调：面板展开时 5 秒一次；收起时只看角标和光晕，
+# 它们的变化几乎都伴随钩子事件（提交输入、等你决策、一轮结束、出错停下），事件后 2 秒刷新，另每 60 秒兜底（会话关掉等没有事件的变化）。
+$AGENTS_OPEN_SEC = 5
+$AGENTS_IDLE_SEC = 60
+$AGENTS_AFTER_EVENT_SEC = 2
+$STATE_EVENTS = 'UserPromptSubmit', 'Notification', 'Stop', 'StopFailure'
 $script:agentTask = $null
 $script:agentProc = $null
 $script:nextAgents = [datetime]::MinValue
+# 把下次刷新提前到 $sec 秒后（只提前，不推后）；正在调用时等它结束，结束后按面板开合重新排
+function Refresh-AgentsSoon($sec) {
+  $t = [datetime]::Now.AddSeconds($sec)
+  if ($t -lt $script:nextAgents) { $script:nextAgents = $t }
+}
 function Poll-Agents {
   if ($script:agentTask) {
     if (-not $script:agentTask.IsCompleted) { return }
@@ -350,7 +364,7 @@ function Poll-Agents {
     } catch { }
     try { $script:agentProc.Dispose() } catch { }
     $script:agentTask = $null
-    $script:nextAgents = [datetime]::Now.AddSeconds(5)
+    $script:nextAgents = [datetime]::Now.AddSeconds($(if ($script:open) { $AGENTS_OPEN_SEC } else { $AGENTS_IDLE_SEC }))
     Render
     return
   }
@@ -378,6 +392,8 @@ $ui.Pet.Add_MouseLeftButtonDown({
   try { $win.DragMove() } catch { }
   if ([Math]::Abs($win.Left - $x0) -lt 4 -and [Math]::Abs($win.Top - $y0) -lt 4) {
     $script:open = -not $script:open; $script:flash = $null; Render; Launch
+    # 收起时最多 60 秒刷新一次，点开时列表可能是旧的：马上刷新
+    if ($script:open) { Refresh-AgentsSoon 0 }
   }
   $e.Handled = $true
 })
